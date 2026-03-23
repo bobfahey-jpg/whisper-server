@@ -86,6 +86,11 @@ logging.basicConfig(
 for _h in logging.root.handlers:
     _h.addFilter(_DefaultTagFilter())
 
+# Silence verbose Azure SDK and HTTP client loggers
+logging.getLogger("azure").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Ship all logs to Azure Application Insights if connection string is set
 if APPINSIGHTS:
     try:
