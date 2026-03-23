@@ -207,9 +207,10 @@ def download_mp3(mp3_url, log):
 # ---------------------------------------------------------------------------
 
 # Shared state — loaded once, used by all threads
-_model       = None
-_blob_svc    = None
-_model_lock  = threading.Lock()
+_model            = None
+_blob_svc         = None
+_model_lock       = threading.Lock()
+_transcribe_lock  = threading.Lock()   # only 1 thread transcribes at a time (VRAM limit)
 
 def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
     """One worker thread: claim → download → transcribe → upload → repeat."""
@@ -243,8 +244,9 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
         try:
             tmp_path = download_mp3(mp3_url, log)
 
-            segments, info = _model.transcribe(tmp_path, language="en")
-            text = " ".join(s.text.strip() for s in segments)
+            with _transcribe_lock:
+                segments, info = _model.transcribe(tmp_path, language="en")
+                text = " ".join(s.text.strip() for s in segments)
             elapsed_t = time.time() - t0
             log.info(f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  chars={len(text)}")
 
