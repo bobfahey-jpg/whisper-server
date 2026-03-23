@@ -10,7 +10,7 @@ RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | apt-key add - 
     && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config \
     && echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
 
-RUN pip install --no-cache-dir faster-whisper fastapi uvicorn requests python-multipart pyodbc azure-storage-blob
+RUN pip install --no-cache-dir faster-whisper fastapi uvicorn requests python-multipart pyodbc azure-storage-blob opencensus-ext-azure
 
 WORKDIR /workspace
 COPY whisper_server.py /workspace/whisper_server.py
