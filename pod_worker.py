@@ -34,6 +34,7 @@ Usage:
 import logging
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -57,10 +58,11 @@ SQL_PASSWORD   = os.environ["AZURE_SQL_PASSWORD"]
 BLOB_CONN      = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
 BLOB_CONTAINER = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
 
-NUM_WORKERS  = int(os.environ.get("NUM_WORKERS", "3"))
-MAX_HOURS    = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
-WORKER_ID    = os.environ.get("WORKER_ID", "pod")
-MODEL_NAME   = "large-v3-turbo"
+NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "3"))
+MAX_HOURS     = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
+WORKER_ID     = os.environ.get("WORKER_ID", "pod")
+MODEL_NAME    = "large-v3-turbo"
+APPINSIGHTS   = os.environ.get("APPINSIGHTS_CONNECTION_STRING", "")
 
 DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -83,6 +85,16 @@ logging.basicConfig(
 )
 for _h in logging.root.handlers:
     _h.addFilter(_DefaultTagFilter())
+
+# Ship all logs to Azure Application Insights if connection string is set
+if APPINSIGHTS:
+    try:
+        from opencensus.ext.azure.log_exporter import AzureLogHandler
+        _ai_handler = AzureLogHandler(connection_string=APPINSIGHTS)
+        _ai_handler.addFilter(_DefaultTagFilter())
+        logging.root.addHandler(_ai_handler)
+    except ImportError:
+        pass  # opencensus not installed — skip silently
 
 
 class TaggedLogger(logging.LoggerAdapter):
@@ -205,6 +217,37 @@ def download_mp3(mp3_url, log):
 # ---------------------------------------------------------------------------
 # Single worker thread
 # ---------------------------------------------------------------------------
+
+def gpu_monitor(stop_event):
+    """Sample GPU stats every 30s, log as structured event to App Insights."""
+    log = make_log("gpu")
+    while not stop_event.is_set():
+        try:
+            result = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.free,temperature.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                parts = [p.strip() for p in result.stdout.strip().split(",")]
+                gpu_pct, mem_pct, mem_used, mem_free, temp = (int(p) for p in parts)
+                log.info(
+                    f"GPU {gpu_pct}%  VRAM {mem_used}MB/{mem_used+mem_free}MB  Temp {temp}C",
+                    extra={"custom_dimensions": {
+                        "event_type":    "gpu_metrics",
+                        "pod_id":        WORKER_ID,
+                        "gpu_util_pct":  gpu_pct,
+                        "mem_util_pct":  mem_pct,
+                        "mem_used_mb":   mem_used,
+                        "mem_free_mb":   mem_free,
+                        "gpu_temp_c":    temp,
+                    }}
+                )
+        except Exception:
+            pass
+        stop_event.wait(30)
+
 
 def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
     """One worker thread: claim → download → transcribe → upload → repeat.
@@ -381,6 +424,9 @@ def main():
     log.info(f"Max runtime: {f'{MAX_HOURS:.0f}h' if max_secs else 'unlimited'}")
 
     stop_event = threading.Event()
+
+    # GPU metrics monitor — runs every 30s, ships to App Insights
+    threading.Thread(target=gpu_monitor, args=(stop_event,), daemon=True, name="gpu-monitor").start()
 
     manager = WorkerManager(NUM_WORKERS, stop_event, t_start, max_secs)
 
