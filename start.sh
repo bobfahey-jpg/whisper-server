@@ -1,8 +1,8 @@
 #!/bin/bash
 # start.sh — RunPod container startup script
-# 1. Injects SSH public key from RunPod env var (enables SSH access)
+# 1. Injects SSH public key from RunPod env var
 # 2. Starts sshd
-# 3. Launches pod_worker.py (multi-threaded)
+# 3. Launches 3 independent pod_worker processes (each with own GPU context)
 
 set -e
 
@@ -18,16 +18,24 @@ else
     echo "[start.sh] WARNING: PUBLIC_KEY not set — SSH key auth disabled."
 fi
 
-# Generate host keys if missing (first boot)
 if [[ ! -f /etc/ssh/ssh_host_rsa_key ]]; then
     ssh-keygen -A
-    echo "[start.sh] SSH host keys generated."
 fi
 
-# Start sshd in background
 service ssh start || /usr/sbin/sshd
 echo "[start.sh] sshd started."
 
-# --- Worker ---
-echo "[start.sh] Starting pod_worker.py with NUM_WORKERS=${NUM_WORKERS:-3}"
-exec python3 /workspace/pod_worker.py
+# --- Launch 3 independent workers (nohup — survive SSH disconnect) ---
+echo "[start.sh] Starting 3 independent worker processes..."
+
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-a \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-a.log 2>&1 &
+
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-b \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-b.log 2>&1 &
+
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-c \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-c.log 2>&1 &
+
+echo "[start.sh] All 3 workers launched. Waiting..."
+wait
