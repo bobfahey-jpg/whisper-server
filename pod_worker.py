@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-pod_worker.py — Autonomous, ephemeral sermon transcription worker.
+pod_worker.py — Autonomous, multi-threaded sermon transcription worker.
 
 Runs inside the Docker container on RunPod, Windows, or any machine with a GPU.
 Pulls work from Azure SQL, downloads MP3 from UCG S3, transcribes with Whisper,
 writes transcript to Azure Blob Storage, updates SQL status.
 
+A WorkerManager spawns NUM_WORKERS threads and monitors them — auto-restarting
+any thread that dies. No manual process management needed.
+
 Exits cleanly when:
-  - No more sermons to transcribe
+  - No more sermons to transcribe (all threads idle)
   - MAX_RUNTIME_HOURS has elapsed (0 = run until done)
+  - SIGTERM received (graceful drain)
 
 Configuration (env vars):
   AZURE_SQL_SERVER            sermon-db-fb-1.database.windows.net
@@ -16,6 +20,7 @@ Configuration (env vars):
   AZURE_SQL_USER              sermonadmin
   AZURE_SQL_PASSWORD          ...
   AZURE_STORAGE_CONNECTION_STRING  DefaultEndpointsProtocol=https;...
+  NUM_WORKERS                 3  (default — tune for GPU VRAM)
   MAX_RUNTIME_HOURS           2  (0 = unlimited, e.g. for Windows home machines)
   WORKER_ID                   optional label for logging
 
@@ -23,13 +28,15 @@ Usage:
   python3 pod_worker.py
   docker run --gpus all -e AZURE_SQL_SERVER=... -e AZURE_SQL_PASSWORD=... \\
              -e AZURE_STORAGE_CONNECTION_STRING=... \\
-             bobfahey6709/whisper-worker:latest
+             bobfahey6709/whisper-server:latest
 """
 
 import logging
 import os
+import signal
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -43,15 +50,16 @@ from faster_whisper import WhisperModel
 # Config
 # ---------------------------------------------------------------------------
 
-SQL_SERVER   = os.environ["AZURE_SQL_SERVER"]
-SQL_DB       = os.environ.get("AZURE_SQL_DB", "sermons")
-SQL_USER     = os.environ["AZURE_SQL_USER"]
-SQL_PASSWORD = os.environ["AZURE_SQL_PASSWORD"]
-BLOB_CONN    = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+SQL_SERVER     = os.environ["AZURE_SQL_SERVER"]
+SQL_DB         = os.environ.get("AZURE_SQL_DB", "sermons")
+SQL_USER       = os.environ["AZURE_SQL_USER"]
+SQL_PASSWORD   = os.environ["AZURE_SQL_PASSWORD"]
+BLOB_CONN      = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
 BLOB_CONTAINER = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
 
-MAX_HOURS    = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))  # 0 = unlimited
-WORKER_ID    = os.environ.get("WORKER_ID", "worker")
+NUM_WORKERS  = int(os.environ.get("NUM_WORKERS", "3"))
+MAX_HOURS    = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
+WORKER_ID    = os.environ.get("WORKER_ID", "pod")
 MODEL_NAME   = "large-v3-turbo"
 
 DOWNLOAD_HEADERS = {
@@ -59,29 +67,33 @@ DOWNLOAD_HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — each thread tags its own worker ID
 # ---------------------------------------------------------------------------
+
+class _DefaultTagFilter(logging.Filter):
+    """Ensures %(worker_tag)s is always present — third-party loggers don't set it."""
+    def filter(self, record):
+        if not hasattr(record, "worker_tag"):
+            record.worker_tag = "system"
+        return True
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(worker)s] %(message)s",
+    format="%(asctime)s %(levelname)s [%(worker_tag)s] %(message)s",
 )
-log = logging.getLogger(__name__)
-
-class WorkerFilter(logging.Filter):
-    def filter(self, record):
-        record.worker = WORKER_ID
-        return True
-
-log.addFilter(WorkerFilter())
+for _h in logging.root.handlers:
+    _h.addFilter(_DefaultTagFilter())
 
 
-def ts():
-    return datetime.now().strftime("[%H:%M:%S]")
+class TaggedLogger(logging.LoggerAdapter):
+    def __init__(self, tag):
+        super().__init__(logging.getLogger(__name__), {"worker_tag": tag})
 
+def make_log(tag):
+    return TaggedLogger(tag)
 
 # ---------------------------------------------------------------------------
-# Azure SQL helpers
+# Azure SQL helpers  (each thread gets its own connection)
 # ---------------------------------------------------------------------------
 
 def get_sql_conn():
@@ -96,11 +108,11 @@ def get_sql_conn():
     return pyodbc.connect(conn_str)
 
 
-def claim_sermon(conn):
+def claim_sermon(conn, log):
     """
     Atomically claim the next available sermon.
-    Uses UPDLOCK + READPAST for safe concurrent claiming across multiple pods.
-    Returns (slug, mp3_url) or (None, None) if no work available.
+    UPDLOCK + READPAST = safe for concurrent threads/pods.
+    Returns (slug, mp3_url) or (None, None) if queue is empty.
     """
     cur = conn.cursor()
     try:
@@ -150,7 +162,7 @@ def mark_failed(conn, slug):
 
 
 def mark_not_found(conn, slug):
-    """Permanent failure — bad/deleted file. Don't requeue."""
+    """Permanent failure — bad/deleted file. Never requeue."""
     conn.cursor().execute(
         "UPDATE sermons SET status='not_found', updated_at=? WHERE slug=?",
         (now_utc(), slug)
@@ -166,21 +178,20 @@ def now_utc():
 # Blob Storage helpers
 # ---------------------------------------------------------------------------
 
-def upload_transcript(blob_client, slug, text):
-    """Upload transcript text to Azure Blob, return public URL."""
+def upload_transcript(blob_svc, slug, text):
+    """Upload transcript text, return blob URL."""
     blob_name = f"{slug}.txt"
-    container = blob_client.get_container_client(BLOB_CONTAINER)
+    container = blob_svc.get_container_client(BLOB_CONTAINER)
     container.upload_blob(blob_name, text.encode("utf-8"), overwrite=True)
-    account = blob_client.account_name
+    account = blob_svc.account_name
     return f"https://{account}.blob.core.windows.net/{BLOB_CONTAINER}/{blob_name}"
 
 
 # ---------------------------------------------------------------------------
-# Download helpers
+# Download helper
 # ---------------------------------------------------------------------------
 
-def download_mp3(mp3_url):
-    """Download MP3 to a temp file. Returns path or raises."""
+def download_mp3(mp3_url, log):
     log.info(f"Downloading {mp3_url}")
     r = requests.get(mp3_url, headers=DOWNLOAD_HEADERS, timeout=120)
     r.raise_for_status()
@@ -192,93 +203,76 @@ def download_mp3(mp3_url):
 
 
 # ---------------------------------------------------------------------------
-# Main worker loop
+# Single worker thread
 # ---------------------------------------------------------------------------
 
-def run():
-    t_start = time.time()
-    max_secs = MAX_HOURS * 3600 if MAX_HOURS > 0 else None
+# Shared state — loaded once, used by all threads
+_model       = None
+_blob_svc    = None
+_model_lock  = threading.Lock()
 
-    print(f"{ts()} pod_worker starting — worker_id={WORKER_ID}")
-    print(f"{ts()} Max runtime: {f'{MAX_HOURS:.0f} hours' if max_secs else 'unlimited'}")
+def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
+    """One worker thread: claim → download → transcribe → upload → repeat."""
+    tag = f"{WORKER_ID}-t{thread_num}"
+    log = make_log(tag)
 
-    # Load Whisper model (pre-cached in Docker image — fast)
-    print(f"{ts()} Loading {MODEL_NAME}...")
-    t_model = time.time()
-    model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
-    print(f"{ts()} Model ready in {time.time()-t_model:.1f}s")
+    log.info(f"Thread starting.")
 
-    # Connect to Azure
-    print(f"{ts()} Connecting to Azure SQL...")
     conn = get_sql_conn()
-    print(f"{ts()} Connected.")
-
-    print(f"{ts()} Connecting to Azure Blob Storage...")
-    blob_client = BlobServiceClient.from_connection_string(BLOB_CONN)
-    print(f"{ts()} Connected.")
+    log.info("SQL connected.")
 
     processed = 0
     consecutive_failures = 0
 
-    while True:
-        # Check runtime limit
-        elapsed = time.time() - t_start
-        if max_secs and elapsed >= max_secs:
-            print(f"{ts()} {MAX_HOURS:.0f}-hour limit reached — exiting cleanly after {processed} sermons.")
+    while not stop_event.is_set():
+        # Runtime limit check
+        if max_secs and (time.time() - t_start) >= max_secs:
+            log.info(f"Runtime limit reached — thread exiting after {processed} sermons.")
             break
 
-        # Claim next sermon
-        slug, mp3_url = claim_sermon(conn)
+        slug, mp3_url = claim_sermon(conn, log)
         if not slug:
-            if processed == 0:
-                print(f"{ts()} No work available — exiting.")
-            else:
-                print(f"{ts()} Queue empty — exiting after {processed} sermons.")
+            log.info("Queue empty — thread exiting.")
             break
 
-        print(f"{ts()} START {slug[:60]}")
+        idle_event.clear()
+        log.info(f"START {slug[:60]}")
         t0 = time.time()
         tmp_path = None
 
         try:
-            # Download
-            tmp_path = download_mp3(mp3_url)
+            tmp_path = download_mp3(mp3_url, log)
 
-            # Transcribe
-            segments, info = model.transcribe(tmp_path, language="en")
+            segments, info = _model.transcribe(tmp_path, language="en")
             text = " ".join(s.text.strip() for s in segments)
-            elapsed_transcribe = time.time() - t0
-            print(f"{ts()} TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  transcribe={elapsed_transcribe:.0f}s  chars={len(text)}")
+            elapsed_t = time.time() - t0
+            log.info(f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  chars={len(text)}")
 
-            # Upload to Blob
-            transcript_url = upload_transcript(blob_client, slug, text)
-
-            # Update SQL
+            transcript_url = upload_transcript(_blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
 
             processed += 1
             consecutive_failures = 0
-            total_elapsed = time.time() - t_start
-            print(f"{ts()} DONE  {slug[:50]}  ({processed} total, {total_elapsed/3600:.1f}h elapsed)")
+            log.info(f"DONE {slug[:50]}  ({processed} total this thread)")
 
         except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code if e.response is not None else 0
-            if status_code in (403, 404):
-                log.warning(f"PERMANENT {status_code} for {slug} — marking not_found")
+            code = e.response.status_code if e.response is not None else 0
+            if code in (403, 404):
+                log.warning(f"PERMANENT {code} — marking not_found: {slug}")
                 try:
                     mark_not_found(conn, slug)
                 except Exception:
                     pass
-                # Don't count toward consecutive_failures — move on immediately
+                # Not a failure — keep going immediately
             else:
-                log.error(f"FAILED {slug}: {e}\n{traceback.format_exc()}")
+                log.error(f"HTTP {code} FAILED {slug}: {e}")
                 try:
                     mark_failed(conn, slug)
                 except Exception:
                     pass
                 consecutive_failures += 1
                 if consecutive_failures >= 5:
-                    print(f"{ts()} 5 consecutive failures — exiting to avoid spinning.")
+                    log.error("5 consecutive failures — thread exiting.")
                     break
                 time.sleep(15)
 
@@ -290,7 +284,7 @@ def run():
                 pass
             consecutive_failures += 1
             if consecutive_failures >= 5:
-                print(f"{ts()} 5 consecutive failures — exiting to avoid spinning.")
+                log.error("5 consecutive failures — thread exiting.")
                 break
             time.sleep(15)
 
@@ -302,8 +296,117 @@ def run():
                     pass
 
     conn.close()
-    print(f"{ts()} pod_worker done. Processed {processed} sermons in {(time.time()-t_start)/3600:.1f}h.")
+    log.info(f"Thread done. Processed {processed} sermons.")
+
+
+# ---------------------------------------------------------------------------
+# WorkerManager — starts, monitors, restarts worker threads
+# ---------------------------------------------------------------------------
+
+class WorkerManager:
+    def __init__(self, num_workers, stop_event, t_start, max_secs):
+        self.num_workers = num_workers
+        self.stop_event  = stop_event
+        self.t_start     = t_start
+        self.max_secs    = max_secs
+        self.threads     = {}   # thread_num → Thread
+        self.idle_event  = threading.Event()
+
+    def _spawn(self, n):
+        t = threading.Thread(
+            target=worker_thread,
+            args=(n, self.stop_event, self.idle_event, self.t_start, self.max_secs),
+            name=f"worker-{n}",
+            daemon=True,
+        )
+        t.start()
+        self.threads[n] = t
+        return t
+
+    def start(self):
+        log = make_log("manager")
+        log.info(f"Starting {self.num_workers} worker threads.")
+        for n in range(self.num_workers):
+            self._spawn(n)
+
+    def monitor(self):
+        """
+        Main monitoring loop — runs on the main thread.
+        Auto-restarts dead workers. Exits when all threads finish naturally.
+        """
+        log = make_log("manager")
+        while not self.stop_event.is_set():
+            time.sleep(10)
+
+            all_done = True
+            for n in range(self.num_workers):
+                t = self.threads.get(n)
+                if t and t.is_alive():
+                    all_done = False
+                elif not self.stop_event.is_set():
+                    # Thread exited — check if it was a natural end or a crash
+                    # Restart only if stop not requested
+                    log.info(f"Thread {n} exited — checking for more work.")
+                    new_t = self._spawn(n)
+                    if new_t.is_alive():
+                        all_done = False
+
+            if all_done:
+                log.info("All worker threads completed — manager exiting.")
+                break
+
+        elapsed = time.time() - self.t_start
+        log.info(f"Total runtime: {elapsed/3600:.2f}h")
+
+    def stop(self):
+        make_log("manager").info("SIGTERM received — signalling threads to stop.")
+        self.stop_event.set()
+        for t in self.threads.values():
+            t.join(timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    global _model, _blob_svc
+
+    log = make_log("main")
+
+    t_start  = time.time()
+    max_secs = MAX_HOURS * 3600 if MAX_HOURS > 0 else None
+
+    log.info(f"pod_worker starting — {NUM_WORKERS} threads, worker_id={WORKER_ID}")
+    log.info(f"Max runtime: {f'{MAX_HOURS:.0f}h' if max_secs else 'unlimited'}")
+
+    # Load model once — shared across all threads (thread-safe for inference)
+    log.info(f"Loading {MODEL_NAME}...")
+    t_m = time.time()
+    _model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
+    log.info(f"Model ready in {time.time()-t_m:.1f}s")
+
+    # Blob client — shared (thread-safe)
+    log.info("Connecting to Azure Blob Storage...")
+    _blob_svc = BlobServiceClient.from_connection_string(BLOB_CONN)
+    log.info("Blob connected.")
+
+    stop_event = threading.Event()
+
+    manager = WorkerManager(NUM_WORKERS, stop_event, t_start, max_secs)
+
+    # Graceful shutdown on SIGTERM
+    def handle_sigterm(sig, frame):
+        manager.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    manager.start()
+    manager.monitor()   # blocks until all threads done
+
+    log.info(f"All done. Total elapsed: {(time.time()-t_start)/3600:.2f}h")
 
 
 if __name__ == "__main__":
-    run()
+    main()
