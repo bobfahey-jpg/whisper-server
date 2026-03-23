@@ -206,21 +206,20 @@ def download_mp3(mp3_url, log):
 # Single worker thread
 # ---------------------------------------------------------------------------
 
-# Shared state — loaded once, used by all threads
-_model            = None
-_blob_svc         = None
-_model_lock       = threading.Lock()
-_transcribe_lock  = threading.Lock()   # only 1 thread transcribes at a time (VRAM limit)
-
 def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
-    """One worker thread: claim → download → transcribe → upload → repeat."""
+    """One worker thread: claim → download → transcribe → upload → repeat.
+    Each thread loads its own WhisperModel for independent GPU context.
+    """
     tag = f"{WORKER_ID}-t{thread_num}"
     log = make_log(tag)
 
-    log.info(f"Thread starting.")
+    log.info("Thread starting — loading model...")
+    model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
+    log.info("Model ready.")
 
+    blob_svc = BlobServiceClient.from_connection_string(BLOB_CONN)
     conn = get_sql_conn()
-    log.info("SQL connected.")
+    log.info("SQL + Blob connected.")
 
     processed = 0
     consecutive_failures = 0
@@ -244,13 +243,12 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
         try:
             tmp_path = download_mp3(mp3_url, log)
 
-            with _transcribe_lock:
-                segments, info = _model.transcribe(tmp_path, language="en")
-                text = " ".join(s.text.strip() for s in segments)
+            segments, info = model.transcribe(tmp_path, language="en")
+            text = " ".join(s.text.strip() for s in segments)
             elapsed_t = time.time() - t0
             log.info(f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  chars={len(text)}")
 
-            transcript_url = upload_transcript(_blob_svc, slug, text)
+            transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
 
             processed += 1
@@ -327,9 +325,11 @@ class WorkerManager:
 
     def start(self):
         log = make_log("manager")
-        log.info(f"Starting {self.num_workers} worker threads.")
+        log.info(f"Starting {self.num_workers} worker threads (staggered 20s apart).")
         for n in range(self.num_workers):
             self._spawn(n)
+            if n < self.num_workers - 1:
+                time.sleep(20)
 
     def monitor(self):
         """
@@ -372,26 +372,13 @@ class WorkerManager:
 # ---------------------------------------------------------------------------
 
 def main():
-    global _model, _blob_svc
-
     log = make_log("main")
 
     t_start  = time.time()
     max_secs = MAX_HOURS * 3600 if MAX_HOURS > 0 else None
 
-    log.info(f"pod_worker starting — {NUM_WORKERS} threads, worker_id={WORKER_ID}")
+    log.info(f"pod_worker starting — {NUM_WORKERS} threads (each loads own model), worker_id={WORKER_ID}")
     log.info(f"Max runtime: {f'{MAX_HOURS:.0f}h' if max_secs else 'unlimited'}")
-
-    # Load model once — shared across all threads (thread-safe for inference)
-    log.info(f"Loading {MODEL_NAME}...")
-    t_m = time.time()
-    _model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
-    log.info(f"Model ready in {time.time()-t_m:.1f}s")
-
-    # Blob client — shared (thread-safe)
-    log.info("Connecting to Azure Blob Storage...")
-    _blob_svc = BlobServiceClient.from_connection_string(BLOB_CONN)
-    log.info("Blob connected.")
 
     stop_event = threading.Event()
 
