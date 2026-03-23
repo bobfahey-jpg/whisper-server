@@ -149,6 +149,15 @@ def mark_failed(conn, slug):
     conn.commit()
 
 
+def mark_not_found(conn, slug):
+    """Permanent failure — bad/deleted file. Don't requeue."""
+    conn.cursor().execute(
+        "UPDATE sermons SET status='not_found', updated_at=? WHERE slug=?",
+        (now_utc(), slug)
+    )
+    conn.commit()
+
+
 def now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -251,6 +260,27 @@ def run():
             consecutive_failures = 0
             total_elapsed = time.time() - t_start
             print(f"{ts()} DONE  {slug[:50]}  ({processed} total, {total_elapsed/3600:.1f}h elapsed)")
+
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else 0
+            if status_code in (403, 404):
+                log.warning(f"PERMANENT {status_code} for {slug} — marking not_found")
+                try:
+                    mark_not_found(conn, slug)
+                except Exception:
+                    pass
+                # Don't count toward consecutive_failures — move on immediately
+            else:
+                log.error(f"FAILED {slug}: {e}\n{traceback.format_exc()}")
+                try:
+                    mark_failed(conn, slug)
+                except Exception:
+                    pass
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    print(f"{ts()} 5 consecutive failures — exiting to avoid spinning.")
+                    break
+                time.sleep(15)
 
         except Exception as e:
             log.error(f"FAILED {slug}: {e}\n{traceback.format_exc()}")
