@@ -445,6 +445,36 @@ class WorkerManager:
 
 
 # ---------------------------------------------------------------------------
+# Self-termination
+# ---------------------------------------------------------------------------
+
+def self_terminate():
+    """Terminate this pod via RunPod API — called when all work is done."""
+    if not RUNPOD_POD_ID:
+        make_log("main").info("No RUNPOD_POD_ID set — skipping self-termination.")
+        return
+    api_key = os.environ.get("RUNPOD_API_KEY", "")
+    if not api_key:
+        make_log("main").warning("No RUNPOD_API_KEY — cannot self-terminate.")
+        return
+    try:
+        log = make_log("main")
+        log.info(f"Self-terminating pod {RUNPOD_POD_ID}...")
+        r = requests.post(
+            "https://api.runpod.io/graphql",
+            json={"query": f'mutation {{ podTerminate(input: {{podId: "{RUNPOD_POD_ID}"}}) }}'},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15
+        )
+        if r.status_code == 200:
+            log.info("Pod termination requested successfully.")
+        else:
+            log.warning(f"Termination request returned {r.status_code}")
+    except Exception as e:
+        make_log("main").error(f"Self-termination failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -475,6 +505,7 @@ def main():
     manager.monitor()   # blocks until all threads done
 
     log.info(f"All done. Total elapsed: {(time.time()-t_start)/3600:.2f}h")
+    self_terminate()
 
 
 if __name__ == "__main__":
