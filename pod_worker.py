@@ -60,9 +60,14 @@ BLOB_CONTAINER = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
 
 NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "3"))
 MAX_HOURS     = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
-WORKER_ID     = os.environ.get("WORKER_ID", "pod")
 MODEL_NAME    = "large-v3-turbo"
 APPINSIGHTS   = os.environ.get("APPINSIGHTS_CONNECTION_STRING", "")
+
+# Pod identity — prefer explicit WORKER_ID, fall back to RunPod-injected pod ID, then hostname
+import socket as _socket
+RUNPOD_POD_ID = os.environ.get("RUNPOD_POD_ID", "")
+HOSTNAME      = _socket.gethostname()
+WORKER_ID     = os.environ.get("WORKER_ID") or RUNPOD_POD_ID or HOSTNAME
 
 DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -238,15 +243,17 @@ def gpu_monitor(stop_event):
                 parts = [p.strip() for p in result.stdout.strip().split(",")]
                 gpu_pct, mem_pct, mem_used, mem_free, temp = (int(p) for p in parts)
                 log.info(
-                    f"GPU {gpu_pct}%  VRAM {mem_used}MB/{mem_used+mem_free}MB  Temp {temp}C",
+                    f"GPU {gpu_pct}%  VRAM {mem_used}MB/{mem_used+mem_free}MB  Temp {temp}C  pod={WORKER_ID}",
                     extra={"custom_dimensions": {
-                        "event_type":    "gpu_metrics",
-                        "pod_id":        WORKER_ID,
-                        "gpu_util_pct":  gpu_pct,
-                        "mem_util_pct":  mem_pct,
-                        "mem_used_mb":   mem_used,
-                        "mem_free_mb":   mem_free,
-                        "gpu_temp_c":    temp,
+                        "event_type":      "gpu_metrics",
+                        "pod_id":          WORKER_ID,
+                        "runpod_pod_id":   RUNPOD_POD_ID,
+                        "hostname":        HOSTNAME,
+                        "gpu_util_pct":    gpu_pct,
+                        "mem_util_pct":    mem_pct,
+                        "mem_used_mb":     mem_used,
+                        "mem_free_mb":     mem_free,
+                        "gpu_temp_c":      temp,
                     }}
                 )
         except Exception:
@@ -294,7 +301,19 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
             segments, info = model.transcribe(tmp_path, language="en")
             text = " ".join(s.text.strip() for s in segments)
             elapsed_t = time.time() - t0
-            log.info(f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  chars={len(text)}")
+            log.info(
+                f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  chars={len(text)}  pod={WORKER_ID}",
+                extra={"custom_dimensions": {
+                    "event_type":    "transcription_complete",
+                    "pod_id":        WORKER_ID,
+                    "runpod_pod_id": RUNPOD_POD_ID,
+                    "hostname":      HOSTNAME,
+                    "slug":          slug,
+                    "audio_secs":    round(info.duration),
+                    "elapsed_secs":  round(elapsed_t),
+                    "char_count":    len(text),
+                }}
+            )
 
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
