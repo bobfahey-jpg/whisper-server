@@ -111,6 +111,16 @@ class TaggedLogger(logging.LoggerAdapter):
     def __init__(self, tag):
         super().__init__(logging.getLogger(__name__), {"worker_tag": tag})
 
+    def process(self, msg, kwargs):
+        """Merge caller's extra with our tag extra instead of replacing it."""
+        caller_extra = kwargs.get("extra", {})
+        merged = {**self.extra, **caller_extra}
+        # Ensure custom_dimensions also carries worker_tag
+        if "custom_dimensions" in merged:
+            merged["custom_dimensions"].setdefault("worker_tag", self.extra.get("worker_tag", ""))
+        kwargs["extra"] = merged
+        return msg, kwargs
+
 def make_log(tag):
     return TaggedLogger(tag)
 
