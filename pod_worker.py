@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-pod_worker.py — Autonomous, multi-threaded sermon transcription worker.
+pod_worker.py — Autonomous sermon transcription + enrichment worker.
 
 Runs inside the Docker container on RunPod, Windows, or any machine with a GPU.
 Pulls work from Azure SQL, downloads MP3 from UCG S3, transcribes with Whisper,
-writes transcript to Azure Blob Storage, updates SQL status.
+then runs the full per-sermon enrichment pipeline on a CPU background thread:
+  Grok processing → sermon_nlp → sermon_scripture → sermon_occasion → sermon_topic_classifier
 
-A WorkerManager spawns NUM_WORKERS threads and monitors them — auto-restarting
-any thread that dies. No manual process management needed.
+Speaker-level rollups (speaker_profile, speaker_eval_claude, speaker_eval_docx) are
+triggered by the Mac orchestrator (pipeline_grok.py) when a speaker's queue drains.
+
+Each pod runs as NUM_WORKERS independent processes (via start.sh), each with its own
+GPU context — avoids CUDA shared-memory issues with multi-threaded models.
+
+Status flow per sermon:
+  metadata_scraped → queued → transcribed → enriching → processed
 
 Exits cleanly when:
-  - No more sermons to transcribe (all threads idle)
+  - No more sermons to transcribe (queue empty)
   - MAX_RUNTIME_HOURS has elapsed (0 = run until done)
   - SIGTERM received (graceful drain)
 
@@ -20,15 +27,16 @@ Configuration (env vars):
   AZURE_SQL_USER              sermonadmin
   AZURE_SQL_PASSWORD          ...
   AZURE_STORAGE_CONNECTION_STRING  DefaultEndpointsProtocol=https;...
-  NUM_WORKERS                 3  (default — tune for GPU VRAM)
-  MAX_RUNTIME_HOURS           2  (0 = unlimited, e.g. for Windows home machines)
+  OPENAI_API_KEY              xAI API key (used for Grok processing)
+  GROK_MODEL                  grok-4-1-fast-non-reasoning (default)
+  NUM_WORKERS                 1  (per-process; start.sh launches multiple processes)
+  NUM_CPU_WORKERS             2  (enrichment threads per process)
+  MAX_RUNTIME_HOURS           2  (0 = unlimited)
   WORKER_ID                   optional label for logging
 
 Usage:
   python3 pod_worker.py
-  docker run --gpus all -e AZURE_SQL_SERVER=... -e AZURE_SQL_PASSWORD=... \\
-             -e AZURE_STORAGE_CONNECTION_STRING=... \\
-             bobfahey6709/whisper-server:latest
+  docker run --gpus all -e AZURE_SQL_SERVER=... bobfahey6709/whisper-server:latest
 """
 
 import logging
@@ -40,12 +48,24 @@ import tempfile
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyodbc
 import requests
 from azure.storage.blob import BlobServiceClient
 from faster_whisper import WhisperModel
+
+# ── Enrichment scripts path (mirrors local tools/sermons/ layout) ──────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+
+try:
+    from sermon_processor import process_transcript
+    _HAS_ENRICHMENT = True
+except ImportError:
+    _HAS_ENRICHMENT = False
 
 # ---------------------------------------------------------------------------
 # Config
@@ -56,12 +76,14 @@ SQL_DB         = os.environ.get("AZURE_SQL_DB", "sermons")
 SQL_USER       = os.environ["AZURE_SQL_USER"]
 SQL_PASSWORD   = os.environ["AZURE_SQL_PASSWORD"]
 BLOB_CONN      = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-BLOB_CONTAINER = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
+BLOB_CONTAINER   = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
+BLOB_PROCESSED   = os.environ.get("AZURE_BLOB_PROCESSED",   "processed")
 
-NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "3"))
-MAX_HOURS     = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
-MODEL_NAME    = "large-v3-turbo"
-APPINSIGHTS   = os.environ.get("APPINSIGHTS_CONNECTION_STRING", "")
+NUM_WORKERS     = int(os.environ.get("NUM_WORKERS", "1"))
+NUM_CPU_WORKERS = int(os.environ.get("NUM_CPU_WORKERS", "2"))
+MAX_HOURS       = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
+MODEL_NAME      = "large-v3-turbo"
+APPINSIGHTS     = os.environ.get("APPINSIGHTS_CONNECTION_STRING", "")
 
 # Pod identity — prefer explicit WORKER_ID, fall back to RunPod-injected pod ID, then hostname
 import socket as _socket
@@ -74,11 +96,10 @@ DOWNLOAD_HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Logging — each thread tags its own worker ID
+# Logging
 # ---------------------------------------------------------------------------
 
 class _DefaultTagFilter(logging.Filter):
-    """Ensures %(worker_tag)s is always present — third-party loggers don't set it."""
     def filter(self, record):
         if not hasattr(record, "worker_tag"):
             record.worker_tag = "system"
@@ -91,12 +112,10 @@ logging.basicConfig(
 for _h in logging.root.handlers:
     _h.addFilter(_DefaultTagFilter())
 
-# Silence verbose Azure SDK and HTTP client loggers
 logging.getLogger("azure").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Ship all logs to Azure Application Insights if connection string is set
 if APPINSIGHTS:
     try:
         from opencensus.ext.azure.log_exporter import AzureLogHandler
@@ -104,7 +123,7 @@ if APPINSIGHTS:
         _ai_handler.addFilter(_DefaultTagFilter())
         logging.root.addHandler(_ai_handler)
     except ImportError:
-        pass  # opencensus not installed — skip silently
+        pass
 
 
 class TaggedLogger(logging.LoggerAdapter):
@@ -112,10 +131,8 @@ class TaggedLogger(logging.LoggerAdapter):
         super().__init__(logging.getLogger(__name__), {"worker_tag": tag})
 
     def process(self, msg, kwargs):
-        """Merge caller's extra with our tag extra instead of replacing it."""
         caller_extra = kwargs.get("extra", {})
         merged = {**self.extra, **caller_extra}
-        # Ensure custom_dimensions also carries worker_tag
         if "custom_dimensions" in merged:
             merged["custom_dimensions"].setdefault("worker_tag", self.extra.get("worker_tag", ""))
         kwargs["extra"] = merged
@@ -125,7 +142,7 @@ def make_log(tag):
     return TaggedLogger(tag)
 
 # ---------------------------------------------------------------------------
-# Azure SQL helpers  (each thread gets its own connection)
+# Azure SQL helpers
 # ---------------------------------------------------------------------------
 
 def get_sql_conn():
@@ -140,17 +157,30 @@ def get_sql_conn():
     return pyodbc.connect(conn_str)
 
 
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _update_status(slug: str, status: str):
+    conn = get_sql_conn()
+    try:
+        conn.execute("UPDATE sermons SET status=?, updated_at=? WHERE slug=?",
+                     (status, now_utc(), slug))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def claim_sermon(conn, log):
     """
-    Atomically claim the next available sermon.
-    UPDLOCK + READPAST = safe for concurrent threads/pods.
-    Returns (slug, mp3_url) or (None, None) if queue is empty.
+    Atomically claim the next available sermon. Returns (slug, mp3_url, metadata) or
+    (None, None, None) if queue is empty.
     """
     cur = conn.cursor()
     try:
         cur.execute("BEGIN TRANSACTION")
         cur.execute("""
-            SELECT TOP 1 slug, mp3_url
+            SELECT TOP 1 slug, mp3_url, title, speaker, congregation, date, duration, page_url
             FROM sermons WITH (UPDLOCK, READPAST)
             WHERE status = 'metadata_scraped'
               AND mp3_url LIKE '%.mp3%'
@@ -159,22 +189,30 @@ def claim_sermon(conn, log):
         row = cur.fetchone()
         if not row:
             cur.execute("ROLLBACK")
-            return None, None
+            return None, None, None
         slug, mp3_url = row[0], row[1]
+        metadata = {
+            "title":        row[2] or slug,
+            "speaker":      row[3] or "",
+            "congregation": row[4] or "",
+            "date":         str(row[5]) if row[5] else "",
+            "duration":     str(row[6]) if row[6] else "",
+            "page_url":     row[7] or "",
+        }
         cur.execute(
-            "UPDATE sermons SET status='queued', updated_at=? WHERE slug=?",
+            "UPDATE sermons SET status='queued', updated_at=? WHERE slug=? AND status='metadata_scraped'",
             (now_utc(), slug)
         )
         cur.execute("COMMIT")
         conn.commit()
-        return slug, mp3_url
+        return slug, mp3_url, metadata
     except Exception as e:
         try:
             cur.execute("ROLLBACK")
         except Exception:
             pass
         log.error(f"claim_sermon failed: {e}")
-        return None, None
+        return None, None, None
 
 
 def mark_transcribed(conn, slug, transcript_url):
@@ -194,7 +232,6 @@ def mark_failed(conn, slug):
 
 
 def mark_not_found(conn, slug):
-    """Permanent failure — bad/deleted file. Never requeue."""
     conn.cursor().execute(
         "UPDATE sermons SET status='not_found', updated_at=? WHERE slug=?",
         (now_utc(), slug)
@@ -202,21 +239,21 @@ def mark_not_found(conn, slug):
     conn.commit()
 
 
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 # ---------------------------------------------------------------------------
 # Blob Storage helpers
 # ---------------------------------------------------------------------------
 
 def upload_transcript(blob_svc, slug, text):
-    """Upload transcript text, return blob URL."""
     blob_name = f"{slug}.txt"
     container = blob_svc.get_container_client(BLOB_CONTAINER)
     container.upload_blob(blob_name, text.encode("utf-8"), overwrite=True)
     account = blob_svc.account_name
     return f"https://{account}.blob.core.windows.net/{BLOB_CONTAINER}/{blob_name}"
+
+
+def upload_processed(blob_svc, slug, md_content):
+    container = blob_svc.get_container_client(BLOB_PROCESSED)
+    container.upload_blob(f"{slug}.md", md_content.encode("utf-8"), overwrite=True)
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +272,103 @@ def download_mp3(mp3_url, log):
 
 
 # ---------------------------------------------------------------------------
-# Single worker thread
+# Per-sermon enrichment pipeline (CPU — runs in background thread)
+# ---------------------------------------------------------------------------
+
+def enrich_sermon(slug: str, transcript_text: str, metadata: dict, blob_svc):
+    """
+    Full per-sermon enrichment pipeline. Called from CPU thread pool after transcription.
+    Steps: claim enriching → Grok → upload .md → NLP → scripture → occasion → topic
+    """
+    log = make_log(f"enrich-{WORKER_ID}")
+
+    if not _HAS_ENRICHMENT:
+        log.warning(f"Enrichment skipped — sermon_processor not available: {slug}")
+        return
+
+    # Atomically claim for enrichment (guards against pipeline_grok.py race)
+    conn = get_sql_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE sermons SET status='enriching', updated_at=? WHERE slug=? AND status='transcribed'",
+            (now_utc(), slug)
+        )
+        if cur.rowcount == 0:
+            log.info(f"Enrichment claim missed (already claimed): {slug}")
+            conn.close()
+            return
+        conn.commit()
+    except Exception as e:
+        log.error(f"Enrichment claim failed for {slug}: {e}")
+        conn.close()
+        return
+    finally:
+        conn.close()
+
+    # Step 1: Grok — transcript text → .md content
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8", delete=False) as f:
+            f.write(transcript_text)
+            tmp_path = f.name
+
+        md_content = process_transcript(tmp_path, slug, metadata=metadata)
+        if not md_content:
+            raise Exception("Grok returned no content")
+
+        upload_processed(blob_svc, slug, md_content)
+        log.info(f"Grok done + .md uploaded: {slug}")
+
+    except Exception as e:
+        log.error(f"Grok failed for {slug}: {e}")
+        _update_status(slug, "transcribed")   # revert — pipeline_grok.py fallback
+        return
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    # Mark processed before running enrichment scripts (topic classifier needs .md in blob)
+    _update_status(slug, "processed")
+
+    # Steps 2–5: per-sermon enrichment scripts as subprocesses
+    enrichment_cmds = [
+        ["python3", str(_SCRIPT_DIR / "sermon_nlp.py"),              "--slug", slug],
+        ["python3", str(_SCRIPT_DIR / "sermon_scripture.py"),         "--slug", slug],
+        ["python3", str(_SCRIPT_DIR / "sermon_occasion.py"),          "--slug", slug],
+        ["python3", str(_SCRIPT_DIR / "sermon_topic_classifier.py"),  "--slug", slug],
+    ]
+
+    for cmd in enrichment_cmds:
+        script_name = Path(cmd[1]).stem
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+                                    env=os.environ.copy())
+            if result.returncode != 0:
+                log.warning(f"{script_name} failed for {slug}: {result.stderr[-300:]}")
+            else:
+                log.info(f"{script_name} done: {slug}")
+        except subprocess.TimeoutExpired:
+            log.warning(f"{script_name} timed out for {slug}")
+        except Exception as e:
+            log.warning(f"{script_name} error for {slug}: {e}")
+
+    log.info(f"Full enrichment complete: {slug}", extra={"custom_dimensions": {
+        "event_type":    "enrichment_complete",
+        "pod_id":        WORKER_ID,
+        "runpod_pod_id": RUNPOD_POD_ID,
+        "slug":          slug,
+    }})
+
+
+# ---------------------------------------------------------------------------
+# GPU metrics monitor
 # ---------------------------------------------------------------------------
 
 def gpu_monitor(stop_event):
-    """Sample GPU stats every 30s, log as structured event to App Insights."""
     log = make_log("gpu")
     while not stop_event.is_set():
         try:
@@ -271,9 +400,14 @@ def gpu_monitor(stop_event):
         stop_event.wait(30)
 
 
-def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
-    """One worker thread: claim → download → transcribe → upload → repeat.
-    Each thread loads its own WhisperModel for independent GPU context.
+# ---------------------------------------------------------------------------
+# Single worker thread (GPU transcription)
+# ---------------------------------------------------------------------------
+
+def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_pool):
+    """
+    One worker thread: claim → download → transcribe → upload → submit enrichment → repeat.
+    Loads its own WhisperModel for independent GPU context.
     """
     tag = f"{WORKER_ID}-t{thread_num}"
     log = make_log(tag)
@@ -290,12 +424,11 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
     consecutive_failures = 0
 
     while not stop_event.is_set():
-        # Runtime limit check
         if max_secs and (time.time() - t_start) >= max_secs:
             log.info(f"Runtime limit reached — thread exiting after {processed} sermons.")
             break
 
-        slug, mp3_url = claim_sermon(conn, log)
+        slug, mp3_url, metadata = claim_sermon(conn, log)
         if not slug:
             log.info("Queue empty — thread exiting.")
             break
@@ -328,6 +461,11 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
 
+            # Submit full enrichment pipeline to CPU thread pool (non-blocking)
+            if cpu_pool is not None and _HAS_ENRICHMENT:
+                cpu_pool.submit(enrich_sermon, slug, text, metadata, blob_svc)
+                log.info(f"Enrichment submitted: {slug[:50]}")
+
             processed += 1
             consecutive_failures = 0
             log.info(f"DONE {slug[:50]}  ({processed} total this thread)")
@@ -340,7 +478,6 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
                     mark_not_found(conn, slug)
                 except Exception:
                     pass
-                # Not a failure — keep going immediately
             else:
                 log.error(f"HTTP {code} FAILED {slug}: {e}")
                 try:
@@ -377,22 +514,23 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs):
 
 
 # ---------------------------------------------------------------------------
-# WorkerManager — starts, monitors, restarts worker threads
+# WorkerManager
 # ---------------------------------------------------------------------------
 
 class WorkerManager:
-    def __init__(self, num_workers, stop_event, t_start, max_secs):
+    def __init__(self, num_workers, stop_event, t_start, max_secs, cpu_pool):
         self.num_workers = num_workers
         self.stop_event  = stop_event
         self.t_start     = t_start
         self.max_secs    = max_secs
-        self.threads     = {}   # thread_num → Thread
+        self.cpu_pool    = cpu_pool
+        self.threads     = {}
         self.idle_event  = threading.Event()
 
     def _spawn(self, n):
         t = threading.Thread(
             target=worker_thread,
-            args=(n, self.stop_event, self.idle_event, self.t_start, self.max_secs),
+            args=(n, self.stop_event, self.idle_event, self.t_start, self.max_secs, self.cpu_pool),
             name=f"worker-{n}",
             daemon=True,
         )
@@ -409,27 +547,19 @@ class WorkerManager:
                 time.sleep(20)
 
     def monitor(self):
-        """
-        Main monitoring loop — runs on the main thread.
-        Auto-restarts dead workers. Exits when all threads finish naturally.
-        """
         log = make_log("manager")
         while not self.stop_event.is_set():
             time.sleep(10)
-
             all_done = True
             for n in range(self.num_workers):
                 t = self.threads.get(n)
                 if t and t.is_alive():
                     all_done = False
                 elif not self.stop_event.is_set():
-                    # Thread exited — check if it was a natural end or a crash
-                    # Restart only if stop not requested
                     log.info(f"Thread {n} exited — checking for more work.")
                     new_t = self._spawn(n)
                     if new_t.is_alive():
                         all_done = False
-
             if all_done:
                 log.info("All worker threads completed — manager exiting.")
                 break
@@ -449,7 +579,6 @@ class WorkerManager:
 # ---------------------------------------------------------------------------
 
 def self_terminate():
-    """Terminate this pod via RunPod API — called when all work is done."""
     if not RUNPOD_POD_ID:
         make_log("main").info("No RUNPOD_POD_ID set — skipping self-termination.")
         return
@@ -484,25 +613,37 @@ def main():
     t_start  = time.time()
     max_secs = MAX_HOURS * 3600 if MAX_HOURS > 0 else None
 
-    log.info(f"pod_worker starting — {NUM_WORKERS} threads (each loads own model), worker_id={WORKER_ID}")
+    enrichment_status = "enabled" if _HAS_ENRICHMENT else "DISABLED (sermon_processor not found)"
+    log.info(f"pod_worker starting — {NUM_WORKERS} threads, enrichment={enrichment_status}, worker_id={WORKER_ID}")
     log.info(f"Max runtime: {f'{MAX_HOURS:.0f}h' if max_secs else 'unlimited'}")
 
     stop_event = threading.Event()
 
-    # GPU metrics monitor — runs every 30s, ships to App Insights
+    # CPU thread pool for enrichment (separate from GPU threads — no CUDA sharing)
+    cpu_pool = ThreadPoolExecutor(
+        max_workers=NUM_CPU_WORKERS,
+        thread_name_prefix="enrich"
+    ) if _HAS_ENRICHMENT else None
+
     threading.Thread(target=gpu_monitor, args=(stop_event,), daemon=True, name="gpu-monitor").start()
 
-    manager = WorkerManager(NUM_WORKERS, stop_event, t_start, max_secs)
+    manager = WorkerManager(NUM_WORKERS, stop_event, t_start, max_secs, cpu_pool)
 
-    # Graceful shutdown on SIGTERM
     def handle_sigterm(sig, frame):
         manager.stop()
+        if cpu_pool:
+            cpu_pool.shutdown(wait=False)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     manager.start()
-    manager.monitor()   # blocks until all threads done
+    manager.monitor()   # blocks until all GPU threads done
+
+    # Wait for any in-flight enrichment to finish
+    if cpu_pool:
+        log.info("GPU work done — waiting for enrichment threads to finish...")
+        cpu_pool.shutdown(wait=True)
 
     log.info(f"All done. Total elapsed: {(time.time()-t_start)/3600:.2f}h")
     self_terminate()
