@@ -58,8 +58,11 @@ from azure.storage.blob import BlobServiceClient
 from faster_whisper import WhisperModel
 
 # ── Enrichment scripts path (mirrors local tools/sermons/ layout) ──────────────
+# On the pod, pod_worker.py lives at /workspace/ but scripts are in /workspace/tools/sermons/
+# Locally, pod_worker.py lives inside tools/sermons/ — add both so import works either way
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
+sys.path.insert(0, str(_SCRIPT_DIR / "tools" / "sermons"))
 
 try:
     from sermon_processor import process_transcript
