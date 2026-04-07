@@ -13,7 +13,7 @@ RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | apt-key add - 
 # Core deps + enrichment deps
 RUN pip install --no-cache-dir \
     faster-whisper fastapi uvicorn requests python-multipart pyodbc azure-storage-blob \
-    opencensus-ext-azure openai textstat vaderSentiment pandas pyarrow
+    opencensus-ext-azure openai textstat vaderSentiment pandas pyarrow python-dotenv
 
 # Workspace layout mirrors local tools/sermons/ so ROOT detection works
 WORKDIR /workspace
