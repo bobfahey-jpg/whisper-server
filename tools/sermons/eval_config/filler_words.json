@@ -1,0 +1,12 @@
+{
+  "version": "1.0",
+  "fillers": [
+    "you know", "i mean", "basically", "literally", "actually",
+    "sort of", "kind of", "you see", "as it were", "if you will",
+    "um", "uh", "like", "so", "well", "okay", "right"
+  ],
+  "sermon_specific": [
+    "please turn to", "let me read", "turn with me", "if you would turn",
+    "open your bibles", "let's look at", "go ahead and turn"
+  ]
+}
