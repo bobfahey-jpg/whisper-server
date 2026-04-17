@@ -26,14 +26,14 @@ RUN chmod +x /workspace/start.sh
 # Transcribe-only: sermon_processor.py intentionally omitted
 # pod_worker.py detects its absence and sets _HAS_ENRICHMENT = False
 RUN mkdir -p /workspace/tools/sermons
-COPY sermon_nlp.py              /workspace/tools/sermons/
-COPY sermon_scripture.py        /workspace/tools/sermons/
-COPY sermon_occasion.py         /workspace/tools/sermons/
-COPY sermon_topic_classifier.py /workspace/tools/sermons/
-COPY db.py                      /workspace/tools/sermons/
-COPY holy_day_calendar.py       /workspace/tools/sermons/
+COPY tools/sermons/sermon_nlp.py              /workspace/tools/sermons/
+COPY tools/sermons/sermon_scripture.py        /workspace/tools/sermons/
+COPY tools/sermons/sermon_occasion.py         /workspace/tools/sermons/
+COPY tools/sermons/sermon_topic_classifier.py /workspace/tools/sermons/
+COPY tools/sermons/db.py                      /workspace/tools/sermons/
+COPY tools/sermons/holy_day_calendar.py       /workspace/tools/sermons/
 
-# Pre-bake model — eliminates download on pod startup (~55s boot vs 8 min)
+# Pre-bake model -- eliminates download on pod startup (~55s boot vs 8 min)
 RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8'); print('Model cached.')"
 
 EXPOSE 8765 22
