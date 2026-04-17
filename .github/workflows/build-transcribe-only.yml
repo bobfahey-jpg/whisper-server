@@ -2,6 +2,11 @@ name: Build transcribe-only image
 
 on:
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "Disable build cache (force full rebuild)"
+        required: false
+        default: "false"
 
 jobs:
   build:
@@ -26,5 +31,6 @@ jobs:
           file: Dockerfile.transcribe-only
           push: true
           tags: bobfahey6709/whisper-server:transcribe-only
+          no-cache: ${{ github.event.inputs.no_cache == 'true' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
