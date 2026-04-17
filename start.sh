@@ -2,9 +2,7 @@
 # start.sh — RunPod container startup script
 # 1. Injects SSH public key from RunPod env var
 # 2. Starts sshd
-# 3. Launches NUM_WORKERS independent pod_worker processes (each with own GPU context)
-#    NUM_WORKERS comes from RunPod template env var (default: 3)
-#    Each process loads its own WhisperModel — avoids CUDA shared-memory issues.
+# 3. Launches 5 independent pod_worker processes (each with own GPU context)
 
 set -e
 
@@ -27,16 +25,23 @@ fi
 service ssh start || /usr/sbin/sshd
 echo "[start.sh] sshd started."
 
-# --- Launch independent workers ---
-N=${NUM_WORKERS:-3}
-echo "[start.sh] Starting ${N} independent worker processes (NUM_WORKERS=${N})..."
+# --- Launch 5 independent workers (nohup — survive SSH disconnect) ---
+echo "[start.sh] Starting 5 independent worker processes..."
 
-for i in $(seq 1 $N); do
-    LABEL=$(printf "%02d" $i)
-    NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-w${LABEL} \
-        nohup python3 /workspace/pod_worker.py > /tmp/worker-${LABEL}.log 2>&1 &
-    echo "[start.sh] Launched worker-${LABEL} (PID $!)"
-done
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-a \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-a.log 2>&1 &
 
-echo "[start.sh] All ${N} workers launched. Waiting..."
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-b \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-b.log 2>&1 &
+
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-c \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-c.log 2>&1 &
+
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-d \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-d.log 2>&1 &
+
+NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-e \
+    nohup python3 /workspace/pod_worker.py > /tmp/worker-e.log 2>&1 &
+
+echo "[start.sh] All 5 workers launched. Waiting..."
 wait
