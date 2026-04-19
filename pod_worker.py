@@ -371,6 +371,24 @@ def enrich_sermon(slug: str, transcript_text: str, metadata: dict, blob_svc):
 # GPU metrics monitor
 # ---------------------------------------------------------------------------
 
+def _sql_log_gpu(gpu_pct, mem_pct, mem_used, vram_total, temp):
+    """Write GPU metrics row to Azure SQL (fire-and-forget, swallows errors)."""
+    try:
+        conn = get_sql_conn()
+        conn.execute(
+            """INSERT INTO pod_gpu_metrics
+               (pod_id, runpod_pod_id, hostname, gpu_util_pct, mem_util_pct,
+                mem_used_mb, vram_total_mb, gpu_temp_c)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            WORKER_ID, RUNPOD_POD_ID, HOSTNAME,
+            gpu_pct, mem_pct, mem_used, vram_total, temp,
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 def gpu_monitor(stop_event):
     log = make_log("gpu")
     while not stop_event.is_set():
@@ -384,8 +402,9 @@ def gpu_monitor(stop_event):
             if result.returncode == 0:
                 parts = [p.strip() for p in result.stdout.strip().split(",")]
                 gpu_pct, mem_pct, mem_used, mem_free, temp = (int(p) for p in parts)
+                vram_total = mem_used + mem_free
                 log.info(
-                    f"GPU {gpu_pct}%  VRAM {mem_used}MB/{mem_used+mem_free}MB  Temp {temp}C  pod={WORKER_ID}",
+                    f"GPU {gpu_pct}%  VRAM {mem_used}MB/{vram_total}MB  Temp {temp}C  pod={WORKER_ID}",
                     extra={"custom_dimensions": {
                         "event_type":      "gpu_metrics",
                         "pod_id":          WORKER_ID,
@@ -398,6 +417,11 @@ def gpu_monitor(stop_event):
                         "gpu_temp_c":      temp,
                     }}
                 )
+                threading.Thread(
+                    target=_sql_log_gpu,
+                    args=(gpu_pct, mem_pct, mem_used, vram_total, temp),
+                    daemon=True,
+                ).start()
         except Exception:
             pass
         stop_event.wait(30)
@@ -447,8 +471,9 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
             segments, info = model.transcribe(tmp_path, language="en")
             text = " ".join(s.text.strip() for s in segments)
             elapsed_t = time.time() - t0
+            rtf = round(info.duration / elapsed_t, 1) if elapsed_t > 0 else None
             log.info(
-                f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  chars={len(text)}  pod={WORKER_ID}",
+                f"TRANSCRIBED {slug[:50]}  audio={info.duration:.0f}s  t={elapsed_t:.0f}s  RTF={rtf}x  chars={len(text)}  pod={WORKER_ID}",
                 extra={"custom_dimensions": {
                     "event_type":    "transcription_complete",
                     "pod_id":        WORKER_ID,
@@ -457,9 +482,18 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
                     "slug":          slug,
                     "audio_secs":    round(info.duration),
                     "elapsed_secs":  round(elapsed_t),
+                    "rtf":           rtf,
                     "char_count":    len(text),
                 }}
             )
+            try:
+                conn.execute(
+                    "UPDATE sermons SET elapsed_secs=?, rtf=? WHERE slug=?",
+                    round(elapsed_t), rtf, slug,
+                )
+                conn.commit()
+            except Exception:
+                pass
 
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
