@@ -29,19 +29,19 @@ echo "[start.sh] sshd started."
 echo "[start.sh] Starting 5 independent worker processes..."
 
 NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-a \
-    nohup python3 /workspace/pod_worker.py > /tmp/worker-a.log 2>&1 &
+    nohup python3 /workspace/pod_worker.py 2>&1 | tee /tmp/worker-a.log &
 
 NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-b \
-    nohup python3 /workspace/pod_worker.py > /tmp/worker-b.log 2>&1 &
+    nohup python3 /workspace/pod_worker.py 2>&1 | tee /tmp/worker-b.log &
 
 NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-c \
-    nohup python3 /workspace/pod_worker.py > /tmp/worker-c.log 2>&1 &
+    nohup python3 /workspace/pod_worker.py 2>&1 | tee /tmp/worker-c.log &
 
 NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-d \
-    nohup python3 /workspace/pod_worker.py > /tmp/worker-d.log 2>&1 &
+    nohup python3 /workspace/pod_worker.py 2>&1 | tee /tmp/worker-d.log &
 
 NUM_WORKERS=1 WORKER_ID=${WORKER_ID:-pod}-e \
-    nohup python3 /workspace/pod_worker.py > /tmp/worker-e.log 2>&1 &
+    nohup python3 /workspace/pod_worker.py 2>&1 | tee /tmp/worker-e.log &
 
 echo "[start.sh] All 5 workers launched. Waiting..."
 wait
