@@ -28,7 +28,7 @@ Configuration (env vars):
   AZURE_SQL_PASSWORD          ...
   AZURE_STORAGE_CONNECTION_STRING  DefaultEndpointsProtocol=https;...
   OPENAI_API_KEY              xAI API key (used for Grok processing)
-  GROK_MODEL                  grok-4-1-fast-non-reasoning (default)
+  GROK_MODEL                  grok-3-fast (default; set in .env to override)
   NUM_WORKERS                 1  (per-process; start.sh launches multiple processes)
   NUM_CPU_WORKERS             2  (enrichment threads per process)
   MAX_RUNTIME_HOURS           2  (0 = unlimited)
@@ -522,6 +522,16 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
 
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
+
+            # Voice analysis — runs while MP3 is still on disk (before cleanup)
+            try:
+                from sermon_voice import analyze_voice, store_voice_metrics
+                t_voice = time.time()
+                voice_metrics = analyze_voice(tmp_path)
+                store_voice_metrics(slug, metadata.get("speaker", ""), metadata.get("date"), voice_metrics)
+                log.info(f"VOICE {slug[:50]}  pitch_sd={voice_metrics.get('pitch_sd_hz')}Hz  cpp={voice_metrics.get('cpp_db')}dB  ({time.time()-t_voice:.1f}s)")
+            except Exception as e:
+                log.warning(f"Voice analysis skipped for {slug}: {e}")
 
             # Submit full enrichment pipeline to CPU thread pool (non-blocking)
             if cpu_pool is not None and _HAS_ENRICHMENT:
