@@ -28,7 +28,7 @@ Configuration (env vars):
   AZURE_SQL_PASSWORD          ...
   AZURE_STORAGE_CONNECTION_STRING  DefaultEndpointsProtocol=https;...
   OPENAI_API_KEY              xAI API key (used for Grok processing)
-  GROK_MODEL                  grok-4-1-fast-non-reasoning (default)
+  GROK_MODEL                  grok-3-fast (default; set in .env to override)
   NUM_WORKERS                 1  (per-process; start.sh launches multiple processes)
   NUM_CPU_WORKERS             2  (enrichment threads per process)
   MAX_RUNTIME_HOURS           2  (0 = unlimited)
@@ -186,7 +186,8 @@ def claim_sermon(conn, log):
             SELECT TOP 1 slug, mp3_url, title, speaker, congregation, date, duration, page_url
             FROM sermons WITH (UPDLOCK, READPAST)
             WHERE status = 'metadata_scraped'
-              AND mp3_url LIKE '%.mp3%'
+              AND (mp3_url LIKE '%.mp3%' OR mp3_url LIKE '%.mp4%'
+                OR mp3_url LIKE '%youtube.com%' OR mp3_url LIKE '%youtu.be%')
             ORDER BY priority DESC, date DESC
         """)
         row = cur.fetchone()
@@ -265,6 +266,8 @@ def upload_processed(blob_svc, slug, md_content):
 
 def download_mp3(mp3_url, log):
     log.info(f"Downloading {mp3_url}")
+    if "youtube.com" in mp3_url or "youtu.be" in mp3_url:
+        return _download_youtube(mp3_url, log)
     r = requests.get(mp3_url, headers=DOWNLOAD_HEADERS, timeout=120)
     r.raise_for_status()
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -272,6 +275,28 @@ def download_mp3(mp3_url, log):
     tmp.close()
     log.info(f"Downloaded {len(r.content)/1e6:.1f} MB → {tmp.name}")
     return tmp.name
+
+
+def _download_youtube(url, log):
+    import subprocess, shutil
+    tmp_dir = tempfile.mkdtemp()
+    out_template = os.path.join(tmp_dir, "audio.%(ext)s")
+    cmd = [
+        "yt-dlp", "-x", "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "-o", out_template,
+        "--no-playlist",
+        url,
+    ]
+    log.info(f"yt-dlp: {url}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(f"yt-dlp failed: {result.stderr[-500:]}")
+    mp3_path = os.path.join(tmp_dir, "audio.mp3")
+    size_mb = os.path.getsize(mp3_path) / 1e6
+    log.info(f"yt-dlp downloaded {size_mb:.1f} MB → {mp3_path}")
+    return mp3_path
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +482,9 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
 
         slug, mp3_url, metadata = claim_sermon(conn, log)
         if not slug:
-            log.info("Queue empty — thread exiting.")
-            break
+            log.info("Queue empty — waiting 30s before retry.")
+            time.sleep(30)
+            continue
 
         idle_event.clear()
         log.info(f"START {slug[:60]}")
@@ -497,6 +523,16 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
 
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
+
+            # Voice analysis — runs while MP3 is still on disk (before cleanup)
+            try:
+                from sermon_voice import analyze_voice, store_voice_metrics
+                t_voice = time.time()
+                voice_metrics = analyze_voice(tmp_path)
+                store_voice_metrics(slug, metadata.get("speaker", ""), metadata.get("date"), voice_metrics)
+                log.info(f"VOICE {slug[:50]}  pitch_sd={voice_metrics.get('pitch_sd_hz')}Hz  cpp={voice_metrics.get('cpp_db')}dB  ({time.time()-t_voice:.1f}s)")
+            except Exception as e:
+                log.warning(f"Voice analysis skipped for {slug}: {e}")
 
             # Submit full enrichment pipeline to CPU thread pool (non-blocking)
             if cpu_pool is not None and _HAS_ENRICHMENT:
