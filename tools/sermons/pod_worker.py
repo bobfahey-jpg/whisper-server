@@ -88,7 +88,7 @@ BLOB_CONTAINER   = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
 BLOB_PROCESSED   = os.environ.get("AZURE_BLOB_PROCESSED",   "processed")
 
 NUM_WORKERS     = int(os.environ.get("NUM_WORKERS", "1"))
-NUM_CPU_WORKERS = int(os.environ.get("NUM_CPU_WORKERS", "2"))
+NUM_CPU_WORKERS = int(os.environ.get("NUM_CPU_WORKERS", "5"))
 MAX_HOURS       = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
 MODEL_NAME      = "large-v3-turbo"
 APPINSIGHTS     = os.environ.get("APPINSIGHTS_CONNECTION_STRING", "")
@@ -177,6 +177,29 @@ def _update_status(slug: str, status: str):
         conn.commit()
     finally:
         conn.close()
+
+
+def _post_process(slug, text, metadata, blob_svc, tmp_path, elapsed_secs, rtf, log_tag):
+    """Upload transcript, mark transcribed, launch voice — runs in cpu_pool so GPU worker is free."""
+    log = make_log(log_tag)
+    try:
+        conn = get_sql_conn()
+        try:
+            conn.execute("UPDATE sermons SET elapsed_secs=?, rtf=? WHERE slug=?",
+                         elapsed_secs, rtf, slug)
+            conn.commit()
+        except Exception:
+            pass
+        transcript_url = upload_transcript(blob_svc, slug, text)
+        mark_transcribed(conn, slug, transcript_url)
+        conn.close()
+        if _HAS_ENRICHMENT:
+            enrich_sermon(slug, text, metadata, blob_svc)
+    except Exception as e:
+        log.error(f"post_process failed for {slug}: {e}")
+    finally:
+        if tmp_path:
+            _launch_voice_subprocess(slug, tmp_path, log)
 
 
 def _launch_voice_subprocess(slug, tmp_path, log):
@@ -534,27 +557,10 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
                     "char_count":    len(text),
                 }}
             )
-            try:
-                conn.execute(
-                    "UPDATE sermons SET elapsed_secs=?, rtf=? WHERE slug=?",
-                    round(elapsed_t), rtf, slug,
-                )
-                conn.commit()
-            except Exception:
-                pass
-
-            transcript_url = upload_transcript(blob_svc, slug, text)
-            mark_transcribed(conn, slug, transcript_url)
-
-            # Launch voice analysis as a subprocess — completely separate GIL, won't block GPU workers.
-            # Subprocess owns tmp_path and deletes it (--delete-after flag).
-            _launch_voice_subprocess(slug, tmp_path, log)
-            tmp_path = None  # subprocess owns cleanup
-
-            # Submit full enrichment pipeline to CPU thread pool (non-blocking)
-            if cpu_pool is not None and _HAS_ENRICHMENT:
-                cpu_pool.submit(enrich_sermon, slug, text, metadata, blob_svc)
-                log.info(f"Enrichment submitted: {slug[:50]}")
+            # Submit ALL post-processing to cpu_pool so GPU worker claims next sermon immediately.
+            cpu_pool.submit(_post_process, slug, text, metadata, blob_svc, tmp_path,
+                            round(elapsed_t), rtf, log.extra["worker_tag"])
+            tmp_path = None  # cpu_pool owns cleanup
 
             processed += 1
             consecutive_failures = 0
