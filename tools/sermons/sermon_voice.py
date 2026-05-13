@@ -378,13 +378,19 @@ def main():
     parser.add_argument("--speaker",     help="Process all sermons for this speaker")
     parser.add_argument("--limit",       type=int, default=0, help="Max sermons to process (0=all)")
     parser.add_argument("--mp3-path",    help="Use local MP3 instead of downloading")
-    parser.add_argument("--recompute",   action="store_true", help="Recompute even if already in DB")
+    parser.add_argument("--recompute",    action="store_true", help="Recompute even if already in DB")
+    parser.add_argument("--delete-after", action="store_true", help="Delete --mp3-path after analysis (for pod_worker cleanup)")
     args = parser.parse_args()
 
     skip_existing = not args.recompute
 
     if args.slug:
         process_slug(args.slug, mp3_path=args.mp3_path, skip_existing=skip_existing)
+        if args.delete_after and args.mp3_path:
+            try:
+                os.unlink(args.mp3_path)
+            except Exception:
+                pass
         if args.slug:
             conn = get_db()
             cur  = conn.cursor()
