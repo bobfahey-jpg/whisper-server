@@ -28,7 +28,7 @@ Configuration (env vars):
   AZURE_SQL_PASSWORD          ...
   AZURE_STORAGE_CONNECTION_STRING  DefaultEndpointsProtocol=https;...
   OPENAI_API_KEY              xAI API key (used for Grok processing)
-  GROK_MODEL                  grok-3-fast (default; set in .env to override)
+  GROK_MODEL                  grok-4-1-fast-non-reasoning (default)
   NUM_WORKERS                 1  (per-process; start.sh launches multiple processes)
   NUM_CPU_WORKERS             2  (enrichment threads per process)
   MAX_RUNTIME_HOURS           2  (0 = unlimited)
@@ -70,11 +70,6 @@ try:
 except ImportError:
     _HAS_ENRICHMENT = False
 
-# Voice analysis runs as a subprocess to avoid GIL contention with Parselmouth (C extension)
-_VOICE_SCRIPT = Path(__file__).resolve().parent / "tools" / "sermons" / "sermon_voice.py"
-if not _VOICE_SCRIPT.exists():
-    _VOICE_SCRIPT = Path(__file__).resolve().parent / "sermon_voice.py"
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -88,7 +83,7 @@ BLOB_CONTAINER   = os.environ.get("AZURE_BLOB_TRANSCRIPTS", "transcripts")
 BLOB_PROCESSED   = os.environ.get("AZURE_BLOB_PROCESSED",   "processed")
 
 NUM_WORKERS     = int(os.environ.get("NUM_WORKERS", "1"))
-NUM_CPU_WORKERS = int(os.environ.get("NUM_CPU_WORKERS", "5"))
+NUM_CPU_WORKERS = int(os.environ.get("NUM_CPU_WORKERS", "2"))
 MAX_HOURS       = float(os.environ.get("MAX_RUNTIME_HOURS", "2"))   # 0 = unlimited
 MODEL_NAME      = "large-v3-turbo"
 APPINSIGHTS     = os.environ.get("APPINSIGHTS_CONNECTION_STRING", "")
@@ -179,46 +174,6 @@ def _update_status(slug: str, status: str):
         conn.close()
 
 
-def _post_process(slug, text, metadata, blob_svc, tmp_path, elapsed_secs, rtf, log_tag):
-    """Upload transcript, mark transcribed, launch voice — runs in cpu_pool so GPU worker is free."""
-    log = make_log(log_tag)
-    try:
-        conn = get_sql_conn()
-        try:
-            conn.execute("UPDATE sermons SET elapsed_secs=?, rtf=? WHERE slug=?",
-                         elapsed_secs, rtf, slug)
-            conn.commit()
-        except Exception:
-            pass
-        transcript_url = upload_transcript(blob_svc, slug, text)
-        mark_transcribed(conn, slug, transcript_url)
-        conn.close()
-        if _HAS_ENRICHMENT:
-            enrich_sermon(slug, text, metadata, blob_svc)
-    except Exception as e:
-        log.error(f"post_process failed for {slug}: {e}")
-    finally:
-        if tmp_path:
-            _launch_voice_subprocess(slug, tmp_path, log)
-
-
-def _launch_voice_subprocess(slug, tmp_path, log):
-    """Fire-and-forget: spawn sermon_voice.py as a subprocess (avoids GIL contention)."""
-    try:
-        subprocess.Popen(
-            [sys.executable, str(_VOICE_SCRIPT), "--slug", slug, "--mp3-path", tmp_path, "--delete-after"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        log.info(f"VOICE launched: {slug[:50]}")
-    except Exception as e:
-        log.warning(f"Voice subprocess failed to launch for {slug}: {e}")
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-
 def claim_sermon(conn, log):
     """
     Atomically claim the next available sermon. Returns (slug, mp3_url, metadata) or
@@ -231,8 +186,7 @@ def claim_sermon(conn, log):
             SELECT TOP 1 slug, mp3_url, title, speaker, congregation, date, duration, page_url
             FROM sermons WITH (UPDLOCK, READPAST)
             WHERE status = 'metadata_scraped'
-              AND (mp3_url LIKE '%.mp3%' OR mp3_url LIKE '%.mp4%'
-                OR mp3_url LIKE '%youtube.com%' OR mp3_url LIKE '%youtu.be%')
+              AND mp3_url LIKE '%.mp3%'
             ORDER BY priority DESC, date DESC
         """)
         row = cur.fetchone()
@@ -311,8 +265,6 @@ def upload_processed(blob_svc, slug, md_content):
 
 def download_mp3(mp3_url, log):
     log.info(f"Downloading {mp3_url}")
-    if "youtube.com" in mp3_url or "youtu.be" in mp3_url:
-        return _download_youtube(mp3_url, log)
     r = requests.get(mp3_url, headers=DOWNLOAD_HEADERS, timeout=120)
     r.raise_for_status()
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -320,28 +272,6 @@ def download_mp3(mp3_url, log):
     tmp.close()
     log.info(f"Downloaded {len(r.content)/1e6:.1f} MB → {tmp.name}")
     return tmp.name
-
-
-def _download_youtube(url, log):
-    import subprocess, shutil
-    tmp_dir = tempfile.mkdtemp()
-    out_template = os.path.join(tmp_dir, "audio.%(ext)s")
-    cmd = [
-        "yt-dlp", "-x", "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "-o", out_template,
-        "--no-playlist",
-        url,
-    ]
-    log.info(f"yt-dlp: {url}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"yt-dlp failed: {result.stderr[-500:]}")
-    mp3_path = os.path.join(tmp_dir, "audio.mp3")
-    size_mb = os.path.getsize(mp3_path) / 1e6
-    log.info(f"yt-dlp downloaded {size_mb:.1f} MB → {mp3_path}")
-    return mp3_path
 
 
 # ---------------------------------------------------------------------------
@@ -557,10 +487,22 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
                     "char_count":    len(text),
                 }}
             )
-            # Submit ALL post-processing to cpu_pool so GPU worker claims next sermon immediately.
-            cpu_pool.submit(_post_process, slug, text, metadata, blob_svc, tmp_path,
-                            round(elapsed_t), rtf, log.extra["worker_tag"])
-            tmp_path = None  # cpu_pool owns cleanup
+            try:
+                conn.execute(
+                    "UPDATE sermons SET elapsed_secs=?, rtf=? WHERE slug=?",
+                    round(elapsed_t), rtf, slug,
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+            transcript_url = upload_transcript(blob_svc, slug, text)
+            mark_transcribed(conn, slug, transcript_url)
+
+            # Submit full enrichment pipeline to CPU thread pool (non-blocking)
+            if cpu_pool is not None and _HAS_ENRICHMENT:
+                cpu_pool.submit(enrich_sermon, slug, text, metadata, blob_svc)
+                log.info(f"Enrichment submitted: {slug[:50]}")
 
             processed += 1
             consecutive_failures = 0
