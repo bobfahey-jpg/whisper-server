@@ -13,8 +13,7 @@ RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | apt-key add - 
 RUN pip install --no-cache-dir \
     faster-whisper fastapi uvicorn requests python-multipart \
     pyodbc azure-storage-blob opencensus-ext-azure \
-    openai python-dotenv textstat pandas vaderSentiment yt-dlp \
-    praat-parselmouth pydub scipy numpy
+    openai python-dotenv textstat pandas vaderSentiment yt-dlp
 
 WORKDIR /workspace
 
@@ -33,8 +32,6 @@ COPY tools/sermons/sermon_occasion.py         /workspace/tools/sermons/
 COPY tools/sermons/sermon_topic_classifier.py /workspace/tools/sermons/
 COPY tools/sermons/db.py                      /workspace/tools/sermons/
 COPY tools/sermons/holy_day_calendar.py       /workspace/tools/sermons/
-COPY tools/sermons/sermon_voice.py            /workspace/tools/sermons/
-
 # Pre-bake model — eliminates download on pod startup (~55s boot vs 8 min)
 RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8'); print('Model cached.')"
 
