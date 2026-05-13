@@ -712,7 +712,10 @@ def main():
     ) if _HAS_ENRICHMENT else None
 
     threading.Thread(target=gpu_monitor, args=(stop_event,), daemon=True, name="gpu-monitor").start()
-    threading.Thread(target=voice_consumer_thread, daemon=True, name="voice-consumer").start()
+    # Only the pod-a process runs the voice consumer — all 5 processes share /tmp/voice_cache
+    # and would otherwise each launch duplicate subprocesses for the same MP3.
+    if WORKER_ID.endswith("-a"):
+        threading.Thread(target=voice_consumer_thread, daemon=True, name="voice-consumer").start()
 
     manager = WorkerManager(NUM_WORKERS, stop_event, t_start, max_secs, cpu_pool)
 
