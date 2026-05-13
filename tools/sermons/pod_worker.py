@@ -70,8 +70,10 @@ try:
 except ImportError:
     _HAS_ENRICHMENT = False
 
-# Shared pool for CPU-bound voice analysis (capped at 2 to avoid CPU saturation)
-VOICE_POOL = ThreadPoolExecutor(max_workers=2)
+# Voice analysis runs as a subprocess to avoid GIL contention with Parselmouth (C extension)
+_VOICE_SCRIPT = Path(__file__).resolve().parent / "tools" / "sermons" / "sermon_voice.py"
+if not _VOICE_SCRIPT.exists():
+    _VOICE_SCRIPT = Path(__file__).resolve().parent / "sermon_voice.py"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -177,18 +179,17 @@ def _update_status(slug: str, status: str):
         conn.close()
 
 
-def _voice_task(slug, speaker, date, tmp_path, log_tag):
-    """Background task: run voice analysis then delete the MP3."""
-    log = make_log(log_tag)
+def _launch_voice_subprocess(slug, tmp_path, log):
+    """Fire-and-forget: spawn sermon_voice.py as a subprocess (avoids GIL contention)."""
     try:
-        from sermon_voice import analyze_voice, store_voice_metrics
-        t0 = time.time()
-        voice_metrics = analyze_voice(tmp_path)
-        store_voice_metrics(slug, speaker, date, voice_metrics)
-        log.info(f"VOICE {slug[:50]}  pitch_sd={voice_metrics.get('pitch_sd_hz')}Hz  cpp={voice_metrics.get('cpp_db')}dB  ({time.time()-t0:.1f}s)")
+        subprocess.Popen(
+            [sys.executable, str(_VOICE_SCRIPT), "--slug", slug, "--mp3-path", tmp_path, "--delete-after"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info(f"VOICE launched: {slug[:50]}")
     except Exception as e:
-        log.warning(f"Voice analysis skipped for {slug}: {e}")
-    finally:
+        log.warning(f"Voice subprocess failed to launch for {slug}: {e}")
         try:
             os.unlink(tmp_path)
         except Exception:
@@ -545,14 +546,10 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
 
-            # Submit voice analysis to background pool — runs on CPU while GPU moves to next sermon.
-            # _voice_task owns tmp_path and deletes it when done; set to None so finally skips it.
-            try:
-                VOICE_POOL.submit(_voice_task, slug, metadata.get("speaker", ""), metadata.get("date"), tmp_path, tag)
-                tmp_path = None
-                log.info(f"VOICE submitted: {slug[:50]}")
-            except Exception as e:
-                log.warning(f"Voice pool submit failed for {slug}: {e}")
+            # Launch voice analysis as a subprocess — completely separate GIL, won't block GPU workers.
+            # Subprocess owns tmp_path and deletes it (--delete-after flag).
+            _launch_voice_subprocess(slug, tmp_path, log)
+            tmp_path = None  # subprocess owns cleanup
 
             # Submit full enrichment pipeline to CPU thread pool (non-blocking)
             if cpu_pool is not None and _HAS_ENRICHMENT:
