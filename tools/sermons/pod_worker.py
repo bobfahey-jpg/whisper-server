@@ -70,6 +70,9 @@ try:
 except ImportError:
     _HAS_ENRICHMENT = False
 
+# Shared pool for CPU-bound voice analysis (capped at 2 to avoid CPU saturation)
+VOICE_POOL = ThreadPoolExecutor(max_workers=2)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -172,6 +175,24 @@ def _update_status(slug: str, status: str):
         conn.commit()
     finally:
         conn.close()
+
+
+def _voice_task(slug, speaker, date, tmp_path, log_tag):
+    """Background task: run voice analysis then delete the MP3."""
+    log = make_log(log_tag)
+    try:
+        from sermon_voice import analyze_voice, store_voice_metrics
+        t0 = time.time()
+        voice_metrics = analyze_voice(tmp_path)
+        store_voice_metrics(slug, speaker, date, voice_metrics)
+        log.info(f"VOICE {slug[:50]}  pitch_sd={voice_metrics.get('pitch_sd_hz')}Hz  cpp={voice_metrics.get('cpp_db')}dB  ({time.time()-t0:.1f}s)")
+    except Exception as e:
+        log.warning(f"Voice analysis skipped for {slug}: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 def claim_sermon(conn, log):
@@ -524,15 +545,14 @@ def worker_thread(thread_num, stop_event, idle_event, t_start, max_secs, cpu_poo
             transcript_url = upload_transcript(blob_svc, slug, text)
             mark_transcribed(conn, slug, transcript_url)
 
-            # Voice analysis — runs while MP3 is still on disk (before cleanup)
+            # Submit voice analysis to background pool — runs on CPU while GPU moves to next sermon.
+            # _voice_task owns tmp_path and deletes it when done; set to None so finally skips it.
             try:
-                from sermon_voice import analyze_voice, store_voice_metrics
-                t_voice = time.time()
-                voice_metrics = analyze_voice(tmp_path)
-                store_voice_metrics(slug, metadata.get("speaker", ""), metadata.get("date"), voice_metrics)
-                log.info(f"VOICE {slug[:50]}  pitch_sd={voice_metrics.get('pitch_sd_hz')}Hz  cpp={voice_metrics.get('cpp_db')}dB  ({time.time()-t_voice:.1f}s)")
+                VOICE_POOL.submit(_voice_task, slug, metadata.get("speaker", ""), metadata.get("date"), tmp_path, tag)
+                tmp_path = None
+                log.info(f"VOICE submitted: {slug[:50]}")
             except Exception as e:
-                log.warning(f"Voice analysis skipped for {slug}: {e}")
+                log.warning(f"Voice pool submit failed for {slug}: {e}")
 
             # Submit full enrichment pipeline to CPU thread pool (non-blocking)
             if cpu_pool is not None and _HAS_ENRICHMENT:
